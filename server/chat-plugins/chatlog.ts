@@ -5,11 +5,7 @@
  * @license MIT
  */
 
-import {FS} from "../../lib/fs";
-import {Utils} from '../../lib/utils';
-import * as Dashycode from '../../lib/dashycode';
-import {QueryProcessManager, exec} from "../../lib/process-manager";
-import {Repl} from '../../lib/repl';
+import {Utils, FS, Dashycode, ProcessManager, Repl} from '../../lib';
 import {Config} from '../config-loader';
 import {Dex} from '../../sim/dex';
 import {Chat} from '../chat';
@@ -20,7 +16,9 @@ const MAX_MEMORY = 67108864; // 64MB
 const MAX_PROCESSES = 1;
 const MAX_TOPUSERS = 100;
 
-const UPPER_STAFF_ROOMS = ['upperstaff', 'adminlog'];
+const CHATLOG_PM_TIMEOUT = 1 * 60 * 60 * 1000; // 1 hour
+
+const UPPER_STAFF_ROOMS = ['upperstaff', 'adminlog', 'slowlog'];
 
 interface ChatlogSearch {
 	raw?: boolean;
@@ -334,7 +332,9 @@ export const LogViewer = new class {
 		}
 		const roomid = `battle-${tier}-${number}` as RoomID;
 		context.send(`<div class="pad"><h2>Locating battle logs for the battle ${tier}-${number}...</h2></div>`);
-		const log = await LogReader.findBattleLog(toID(tier), number);
+		const log = await PM.query({
+			queryType: 'battlesearch', roomid: toID(tier), search: number,
+		});
 		if (!log) return context.send(this.error("Logs not found."));
 		const {connection} = context;
 		context.close();
@@ -536,7 +536,7 @@ export abstract class Searcher {
 	abstract searchLinecounts(roomid: RoomID, month: string, user?: ID): Promise<string>;
 	abstract getSharedBattles(userids: string[]): Promise<string[]>;
 	renderLinecountResults(
-		results: {[date: string]: {[userid: string]: number}},
+		results: {[date: string]: {[userid: string]: number}} | null,
 		roomid: RoomID, month: string, user?: ID
 	) {
 		let buf = Utils.html`<div class="pad"><h2>Linecounts on `;
@@ -550,8 +550,18 @@ export abstract class Searcher {
 		if (FS(`logs/chat/${roomid}/${nextMonth}`).existsSync()) {
 			buf += ` <small><a roomid="view-roomstats-${roomid}--${nextMonth}${user ? `--${user}` : ''}">Next month</a></small>`;
 		}
-		buf += `<hr /><ol>`;
-		if (user) {
+		if (!results) {
+			buf += '<hr />';
+			buf += LogViewer.error(`Logs for month '${month}' do not exist on room ${roomid}.`);
+			return buf;
+		} else if (user) {
+			let total = 0;
+			for (const day in results) {
+				if (isNaN(results[day][user])) continue;
+				total += results[day][user];
+			}
+			buf += `<br />Total linecount: ${total}<hr />`;
+			buf += '<ol>';
 			const sortedDays = Object.keys(results).sort((a, b) => (
 				new Date(b).getTime() - new Date(a).getTime()
 			));
@@ -562,6 +572,7 @@ export abstract class Searcher {
 				buf += `${Chat.count(dayResults, 'lines')}</li>`;
 			}
 		} else {
+			buf += '<hr /><ol>';
 			// squish the results together
 			const totalResults: {[k: string]: number} = {};
 			for (const date in results) {
@@ -628,7 +639,7 @@ export class FSLogSearcher extends Searcher {
 	async searchLinecounts(roomid: RoomID, month: string, user?: ID) {
 		const directory = FS(`logs/chat/${roomid}/${month}`);
 		if (!directory.existsSync()) {
-			throw new Chat.ErrorMessage(`Logs for month '${month}' do not exist on room ${roomid}.`);
+			return this.renderLinecountResults(null, roomid, month, user);
 		}
 		const files = await directory.readdir();
 		const results: {[date: string]: {[userid: string]: number}} = {};
@@ -857,7 +868,7 @@ export class RipgrepLogSearcher extends Searcher {
 			if (args) {
 				options.push(...args);
 			}
-			const {stdout} = await exec(['rg', ...options], {
+			const {stdout} = await ProcessManager.exec(['rg', ...options], {
 				maxBuffer: MAX_MEMORY,
 				cwd: `${__dirname}/../../`,
 			});
@@ -980,7 +991,6 @@ export class RipgrepLogSearcher extends Searcher {
 		const {results: rawResults} = await this.ripgrepSearchMonth({
 			search: regexString, raw: true, date: month, room, args,
 		});
-		if (!rawResults.length) return LogViewer.error(`No results found.`);
 		const results: {[k: string]: {[userid: string]: number}} = {};
 		for (const fullLine of rawResults) {
 			const [data, line] = fullLine.split('.txt:');
@@ -1003,10 +1013,10 @@ export class RipgrepLogSearcher extends Searcher {
 		return this.renderLinecountResults(results, room, month, user);
 	}
 	async getSharedBattles(userids: string[]) {
-		const regexString = userids.map(id => `(.*("p(1|2)":"${[...id].join('[^a-zA-Z0-9]*')}[^a-zA-Z0-9]*"))`).join('');
+		const regexString = userids.map(id => `(?=.*?("p(1|2)":"${[...id].join('[^a-zA-Z0-9]*')}[^a-zA-Z0-9]*"))`).join('');
 		const results: string[] = [];
 		try {
-			const {stdout} = await exec(['rg', '-e', regexString, '-i', '-tjson', 'logs/']);
+			const {stdout} = await ProcessManager.exec(['rg', '-e', regexString, '-i', '-tjson', 'logs/', '-P']);
 			for (const line of stdout.split('\n')) {
 				const [name] = line.split(':');
 				const battleName = name.split('/').pop()!;
@@ -1021,25 +1031,42 @@ export class RipgrepLogSearcher extends Searcher {
 
 export const LogSearcher: Searcher = new (Config.chatlogreader === 'ripgrep' ? RipgrepLogSearcher : FSLogSearcher)();
 
-export const PM = new QueryProcessManager<AnyObject, any>(module, async data => {
+export const PM = new ProcessManager.QueryProcessManager<AnyObject, any>(module, async data => {
+	const start = Date.now();
 	try {
+		let result: any;
 		const {date, search, roomid, limit, queryType} = data;
 		switch (queryType) {
 		case 'linecount':
-			return LogSearcher.searchLinecounts(roomid, date, search);
+			result = await LogSearcher.searchLinecounts(roomid, date, search);
+			break;
 		case 'search':
-			return LogSearcher.searchLogs(roomid, search, limit, date);
+			result = await LogSearcher.searchLogs(roomid, search, limit, date);
+			break;
 		case 'sharedsearch':
-			return LogSearcher.getSharedBattles(search);
+			result = await LogSearcher.getSharedBattles(search);
+			break;
+		case 'battlesearch':
+			result = await LogReader.findBattleLog(roomid, search);
+			break;
 		default:
 			return LogViewer.error(`Config.chatlogreader is not configured.`);
 		}
+		const elapsedTime = Date.now() - start;
+		if (elapsedTime > 3000) {
+			Monitor.slow(`[Slow chatlog query]: ${elapsedTime}ms: ${JSON.stringify(data)}`);
+		}
+		return result;
 	} catch (e) {
 		if (e.name?.endsWith('ErrorMessage')) {
 			return LogViewer.error(e.message);
 		}
 		Monitor.crashlog(e, 'A chatlog search query', data);
 		return LogViewer.error(`Sorry! Your chatlog search crashed. We've been notified and will fix this.`);
+	}
+}, CHATLOG_PM_TIMEOUT, message => {
+	if (message.startsWith(`SLOW\n`)) {
+		Monitor.slow(message.slice(5));
 	}
 });
 
@@ -1050,6 +1077,9 @@ if (!PM.isParentProcess) {
 		crashlog(error: Error, source = 'A chatlog search process', details: AnyObject | null = null) {
 			const repr = JSON.stringify([error.name, error.message, source, details]);
 			process.send!(`THROW\n@!!@${repr}\n${error.stack}`);
+		},
+		slow(text: string) {
+			process.send!(`CALLBACK\nSLOW\n${text}`);
 		},
 	};
 	global.Dex = Dex;
@@ -1097,7 +1127,7 @@ export const pages: PageTable = {
 			if (roomid.startsWith('wcop')) {
 				return this.errorReply("WCOP team discussions are super secret.");
 			}
-			if (UPPER_STAFF_ROOMS.includes(roomid)) {
+			if (UPPER_STAFF_ROOMS.includes(roomid) && !user.inRooms.has(roomid)) {
 				return this.errorReply("Upper staff rooms are super secret.");
 			}
 		}
@@ -1174,6 +1204,42 @@ export const pages: PageTable = {
 		void accessLog.writeLine(`${user.id}: battle-${tier}-${num}`);
 		return LogViewer.battle(tier, num, this);
 	},
+	async logsaccess(query) {
+		this.checkCan('rangeban');
+		const type = toID(query.shift());
+		if (type && !['chat', 'battle', 'all', 'battles'].includes(type)) {
+			return this.errorReply(`Invalid log type.`);
+		}
+		let title = '';
+		switch (type) {
+		case 'battle': case 'battles':
+			title = 'Battlelog access log';
+			break;
+		case 'chat':
+			title = 'Chatlog access log';
+			break;
+		default:
+			title = 'Logs access log';
+			break;
+		}
+		const userid = toID(query.shift());
+		let buf = `<div class="pad"><h2>${title}`;
+		if (userid) buf += ` for ${userid}`;
+		buf += `</h2><hr /><ol>`;
+		const accessStream = FS(`logs/chatlog-access.txt`).createReadStream();
+		for await (const line of accessStream.byLine()) {
+			const [id, rest] = Utils.splitFirst(line, ': ');
+			if (userid && id !== userid) continue;
+			if (type === 'battle' && !line.includes('battle-')) continue;
+			if (userid) {
+				buf += `<li>${rest}</li>`;
+			} else {
+				buf += `<li><username>${id}</username>: ${rest}</li>`;
+			}
+		}
+		buf += `</ol>`;
+		return buf;
+	},
 };
 
 export const commands: ChatCommands = {
@@ -1208,13 +1274,14 @@ export const commands: ChatCommands = {
 		let date = 'all';
 		const searches: string[] = [];
 		let limit = '500';
+		let targetRoom: RoomID | undefined = room?.roomid;
 		for (const arg of args) {
 			if (arg.startsWith('room:')) {
-				const id = arg.slice(5);
-				room = Rooms.search(id as RoomID) as Room | null;
-				if (!room) {
+				const id = arg.slice(5).trim().toLowerCase() as RoomID;
+				if (!FS(`logs/chat/${id}`).existsSync()) {
 					return this.errorReply(`Room "${id}" not found.`);
 				}
+				targetRoom = id;
 			} else if (arg.startsWith('limit:')) {
 				limit = arg.slice(6);
 			} else if (arg.startsWith('date:')) {
@@ -1225,11 +1292,11 @@ export const commands: ChatCommands = {
 				searches.push(arg);
 			}
 		}
-		if (!room) {
+		if (!targetRoom) {
 			return this.parse(`/help searchlogs`);
 		}
 		return this.parse(
-			`/join view-chatlog-${room.roomid}--${date}--search-` +
+			`/join view-chatlog-${targetRoom}--${date}--search-` +
 			`${Dashycode.encode(searches.join('+'))}--limit-${limit}`
 		);
 	},
@@ -1286,4 +1353,33 @@ export const commands: ChatCommands = {
 		if (target.startsWith('psim.us/')) target = target.slice(8);
 		return this.parse(`/join view-battlelog-${target}`);
 	},
+	logsaccess(target, room, user) {
+		this.checkCan('rangeban');
+		const [type, userid] = target.split(',').map(toID);
+		return this.parse(`/j view-logsaccess-${type || 'all'}${userid ? `-${userid}` : ''}`);
+	},
+	gcsearch: 'groupchatsearch',
+	async groupchatsearch(target, room, user) {
+		this.checkCan('lock');
+		target = target.toLowerCase().replace(/[^a-z0-9-]+/g, '');
+		if (!target) return this.parse(`/help groupchatsearch`);
+		if (target.length < 3) {
+			return this.errorReply(`Too short of a search term.`);
+		}
+		const files = await FS(`logs/chat`).readdir();
+		const buffer = [];
+		for (const roomid of files) {
+			if (roomid.startsWith('groupchat-') && roomid.includes(target)) {
+				buffer.push(roomid);
+			}
+		}
+		Utils.sortBy(buffer, roomid => !!Rooms.get(roomid));
+		return this.sendReplyBox(
+			`Groupchats with a roomid matching '${target}': ` +
+			(buffer.length ? buffer.map(id => `<a href="/view-chatlog-${id}">${id}</a>`).join('; ') : 'None found.')
+		);
+	},
+	groupchatsearchhelp: [
+		`/groupchatsearch [target] - Searches for logs of groupchats with names containing the [target]. Requires: % @ &`,
+	],
 };

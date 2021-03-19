@@ -12,10 +12,13 @@
 
 import * as path from 'path';
 import * as child_process from 'child_process';
-import {FS} from '../../lib/fs';
-import {Utils} from '../../lib/utils';
+import {FS, Utils, ProcessManager} from '../../lib';
 
-import * as ProcessManager from '../../lib/process-manager';
+interface ProcessData {
+	cmd: string;
+	cpu?: string;
+	time?: string;
+}
 
 function bash(command: string, context: CommandContext, cwd?: string): Promise<[number, string, string]> {
 	context.stafflog(`$ ${command}`);
@@ -31,6 +34,88 @@ function bash(command: string, context: CommandContext, cwd?: string): Promise<[
 	});
 }
 
+function keysIncludingNonEnumerable(obj: object) {
+	const methods = new Set<string>();
+	let current = obj;
+	do {
+		const curProps = Object.getOwnPropertyNames(current);
+		for (const prop of curProps) {
+			methods.add(prop);
+		}
+	} while ((current = Object.getPrototypeOf(current)));
+	return [...methods];
+}
+
+function keysToCopy(obj: object) {
+	return keysIncludingNonEnumerable(obj).filter(
+		// `__` matches sucrase init methods
+		// prop is excluded because it can hit things like hasOwnProperty that are potentially annoying (?) with
+		// the kind of prototype patching we want to do here - same for constructor and valueOf
+		prop => !(prop.includes('__') || prop.toLowerCase().includes('prop') || ['valueOf', 'constructor'].includes(prop))
+	);
+}
+
+/**
+ * @returns {boolean} Whether or not the rebase failed
+ */
+async function updateserver(context: CommandContext, codePath: string) {
+	const exec = (command: string) => bash(command, context, codePath);
+
+	context.sendReply(`Fetching newest version of code in the repository ${codePath}...`);
+
+	let [code, stdout, stderr] = await exec(`git fetch`);
+	if (code) throw new Error(`updateserver: Crash while fetching - make sure this is a Git repository`);
+	if (!stdout && !stderr) {
+		context.sendReply(`There were no updates.`);
+		Monitor.updateServerLock = false;
+		return true;
+	}
+
+	[code, stdout, stderr] = await exec(`git rev-parse HEAD`);
+	if (code || stderr) throw new Error(`updateserver: Crash while grabbing hash`);
+	const oldHash = String(stdout).trim();
+
+	[code, stdout, stderr] = await exec(`git stash save "PS /updateserver autostash"`);
+	let stashedChanges = true;
+	if (code) throw new Error(`updateserver: Crash while stashing`);
+	if ((stdout + stderr).includes("No local changes")) {
+		stashedChanges = false;
+	} else if (stderr) {
+		throw new Error(`updateserver: Crash while stashing`);
+	} else {
+		context.sendReply(`Saving changes...`);
+	}
+
+	// errors can occur while rebasing or popping the stash; make sure to recover
+	try {
+		context.sendReply(`Rebasing...`);
+		[code] = await exec(`git rebase --no-autostash FETCH_HEAD`);
+		if (code) {
+			// conflict while rebasing
+			await exec(`git rebase --abort`);
+			throw new Error(`restore`);
+		}
+
+		if (stashedChanges) {
+			context.sendReply(`Restoring saved changes...`);
+			[code] = await exec(`git stash pop`);
+			if (code) {
+				// conflict while popping stash
+				await exec(`git reset HEAD .`);
+				await exec(`git checkout .`);
+				throw new Error(`restore`);
+			}
+		}
+
+		return true;
+	} catch (e) {
+		// failed while rebasing or popping the stash
+		await exec(`git reset --hard ${oldHash}`);
+		if (stashedChanges) await exec(`git stash pop`);
+		return false;
+	}
+}
+
 async function rebuild(context: CommandContext) {
 	const [, , stderr] = await bash('node ./build', context);
 	if (stderr) {
@@ -40,6 +125,23 @@ async function rebuild(context: CommandContext) {
 
 
 export const commands: ChatCommands = {
+	potd(target, room, user) {
+		this.canUseConsole();
+		const species = Dex.getSpecies(target);
+		if (species.id === Config.potd) {
+			return this.errorReply(`The PotD is already set to ${species.name}`);
+		}
+		if (!species.exists) return this.errorReply(`Pokemon "${target}" not found.`);
+		if (!Dex.getLearnsetData(species.id).learnset) {
+			return this.errorReply(`That Pokemon has no learnset and cannot be used as the PotD.`);
+		}
+		Config.potd = species.id;
+		for (const process of Rooms.PM.processes) {
+			process.getProcess().send(`EVAL\n\nConfig.potd = '${species.id}'`);
+		}
+		this.addGlobalModAction(`${user.name} set the PotD to ${species.name}.`);
+		this.globalModlog(`POTD`, null, species.name);
+	},
 
 	/*********************************************************
 	 * Bot commands (chat-log manipulation)
@@ -217,7 +319,7 @@ export const commands: ChatCommands = {
 		pageid = `${user.id}-${toID(pageid)}`;
 
 		const targetUser = Users.get(targetID)!;
-		if (!targetUser || !targetUser.connected) {
+		if (!targetUser?.connected) {
 			this.errorReply(`User ${this.targetUsername} is not currently online.`);
 			return false;
 		}
@@ -236,7 +338,7 @@ export const commands: ChatCommands = {
 		if (!targetConnections.length) {
 			// no connection has requested it - verify that we share a room
 			this.checkPMHTML(targetUser);
-			targetConnections = [targetUser.connections[0]];
+			targetConnections = targetUser.connections;
 		}
 
 		content = this.checkHTML(content);
@@ -261,7 +363,7 @@ export const commands: ChatCommands = {
 		pageid = `${user.id}-${toID(pageid)}`;
 		if (!userid || !pageid || !target) return this.parse(`/help highlighthtmlpage`);
 		const targetUser = Users.get(userid);
-		if (!targetUser || !targetUser.connected) {
+		if (!targetUser?.connected) {
 			throw new Chat.ErrorMessage(`User ${this.targetUsername} is not currently online.`);
 		}
 		if (targetUser.locked && !this.user.can('lock')) {
@@ -325,10 +427,11 @@ export const commands: ChatCommands = {
 		await rebuild(this);
 
 		const lock = Monitor.hotpatchLock;
-		const hotpatches = ['chat', 'formats', 'loginserver', 'punishments', 'dnsbl', 'modlog'];
-		const version = await Monitor.version();
+		const hotpatches = [
+			'chat', 'formats', 'loginserver', 'punishments', 'dnsbl', 'modlog',
+			'processmanager', 'roomsp', 'usersp',
+		];
 
-		let patch = target;
 		try {
 			Utils.clearRequireCache({exclude: ['/.lib-dist/process-manager']});
 			if (target === 'all') {
@@ -343,13 +446,13 @@ export const commands: ChatCommands = {
 					await this.parse(`/hotpatch ${hotpatch}`);
 				}
 			} else if (target === 'chat' || target === 'commands') {
-				patch = 'chat';
-				if (lock['chat']) {
-					return this.errorReply(`Hot-patching chat has been disabled by ${lock['chat'].by} (${lock['chat'].reason})`);
-				}
 				if (lock['tournaments']) {
 					return this.errorReply(`Hot-patching tournaments has been disabled by ${lock['tournaments'].by} (${lock['tournaments'].reason})`);
 				}
+				if (lock['chat']) {
+					return this.errorReply(`Hot-patching chat has been disabled by ${lock['chat'].by} (${lock['chat'].reason})`);
+				}
+
 				this.sendReply("Hotpatching chat commands...");
 
 				const disabledCommands = Chat.allCommands().filter(c => c.disabled).map(c => `/${c.fullCmd}`);
@@ -378,18 +481,106 @@ export const commands: ChatCommands = {
 				this.sendReply("Reloading chat plugins...");
 				Chat.loadPlugins(oldPlugins);
 				this.sendReply("DONE");
+			} else if (target === 'processmanager') {
+				if (lock['processmanager']) {
+					return this.errorReply(
+						`Hot-patching formats has been disabled by ${lock['processmanager'].by} ` +
+						`(${lock['processmanager'].reason})`
+					);
+				}
+				this.sendReply('Hotpatching processmanager prototypes...');
+
+				// keep references
+				const cache = {...require.cache};
+				Utils.clearRequireCache();
+				const newPM = require('../../lib/process-manager');
+				require.cache = cache;
+
+				const protos = [
+					[ProcessManager.QueryProcessManager, newPM.QueryProcessManager],
+					[ProcessManager.StreamProcessManager, newPM.StreamProcessManager],
+					[ProcessManager.ProcessManager, newPM.ProcessManager],
+					[ProcessManager.RawProcessManager, newPM.RawProcessManager],
+					[ProcessManager.QueryProcessWrapper, newPM.QueryProcessWrapper],
+					[ProcessManager.StreamProcessWrapper, newPM.StreamProcessWrapper],
+					[ProcessManager.RawProcessManager, newPM.RawProcessWrapper],
+				].map(part => part.map(constructor => constructor.prototype));
+
+				for (const [oldProto, newProto] of protos) {
+					const newKeys = keysToCopy(newProto);
+					const oldKeys = keysToCopy(oldProto);
+					for (const key of oldKeys) {
+						if (!newProto[key]) {
+							delete oldProto[key];
+						}
+					}
+					for (const key of newKeys) {
+						oldProto[key] = newProto[key];
+					}
+				}
+				this.sendReply('DONE');
+			} else if (target === 'usersp' || target === 'roomsp') {
+				if (lock[target]) {
+					return this.errorReply(`Hot-patching ${target} has been disabled by ${lock[target].by} (${lock[target].reason})`);
+				}
+				let newProto: any, oldProto: any, message: string;
+				switch (target) {
+				case 'usersp':
+					newProto = require('../users').User.prototype;
+					oldProto = Users.User.prototype;
+					message = 'user prototypes';
+					break;
+				case 'roomsp':
+					newProto = require('../rooms').BasicRoom.prototype;
+					oldProto = Rooms.BasicRoom.prototype;
+					message = 'rooms prototypes';
+					break;
+				}
+
+				this.sendReply(`Hotpatching ${message}...`);
+				const newKeys = keysToCopy(newProto);
+				const oldKeys = keysToCopy(oldProto);
+
+				const counts = {
+					added: 0,
+					updated: 0,
+					deleted: 0,
+				};
+
+				for (const key of oldKeys) {
+					if (!newProto[key]) {
+						counts.deleted++;
+						delete oldProto[key];
+					}
+				}
+				for (const key of newKeys) {
+					if (!oldProto[key]) {
+						counts.added++;
+					} else if (
+						// compare source code
+						typeof oldProto[key] !== 'function' || oldProto[key].toString() !== newProto[key].toString()
+					) {
+						counts.updated++;
+					}
+
+					oldProto[key] = newProto[key];
+				}
+				this.sendReply(`DONE`);
+				this.sendReply(
+					`Updated ${Chat.count(counts.updated, 'methods')}` +
+					(counts.added ? `, added ${Chat.count(counts.added, 'new methods')} to ${message}` : '') +
+					(counts.deleted ? `, and removed ${Chat.count(counts.deleted, 'methods')}.` : '.')
+				);
 			} else if (target === 'tournaments') {
 				if (lock['tournaments']) {
 					return this.errorReply(`Hot-patching tournaments has been disabled by ${lock['tournaments'].by} (${lock['tournaments'].reason})`);
 				}
-
 				this.sendReply("Hotpatching tournaments...");
 
 				global.Tournaments = require('../tournaments').Tournaments;
 				Chat.loadPluginData(Tournaments, 'tournaments');
 				this.sendReply("DONE");
 			} else if (target === 'formats' || target === 'battles') {
-				patch = 'formats';
 				if (lock['formats']) {
 					return this.errorReply(`Hot-patching formats has been disabled by ${lock['formats'].by} (${lock['formats'].reason})`);
 				}
@@ -418,7 +609,6 @@ export const commands: ChatCommands = {
 				global.LoginServer = require('../loginserver').LoginServer;
 				this.sendReply("DONE. New login server requests will use the new code.");
 			} else if (target === 'learnsets' || target === 'validator') {
-				patch = 'validator';
 				if (lock['validator']) {
 					return this.errorReply(`Hot-patching the validator has been disabled by ${lock['validator'].by} (${lock['validator'].reason})`);
 				}
@@ -430,7 +620,6 @@ export const commands: ChatCommands = {
 				void TeamValidatorAsync.PM.respawn();
 				this.sendReply("DONE. Any battles started after now will have teams be validated according to the new code.");
 			} else if (target === 'punishments') {
-				patch = 'punishments';
 				if (lock['punishments']) {
 					return this.errorReply(`Hot-patching punishments has been disabled by ${lock['punishments'].by} (${lock['punishments'].reason})`);
 				}
@@ -439,14 +628,12 @@ export const commands: ChatCommands = {
 				global.Punishments = require('../punishments').Punishments;
 				this.sendReply("DONE");
 			} else if (target === 'dnsbl' || target === 'datacenters' || target === 'iptools') {
-				patch = 'dnsbl';
 				this.sendReply("Hotpatching ip-tools...");
 
 				global.IPTools = require('../ip-tools').IPTools;
 				void IPTools.loadHostsAndRanges();
 				this.sendReply("DONE");
 			} else if (target === 'modlog') {
-				patch = 'modlog';
 				if (lock['modlog']) {
 					return this.errorReply(`Hot-patching modlogs has been disabled by ${lock['modlog'].by} (${lock['modlog'].reason})`);
 				}
@@ -460,11 +647,8 @@ export const commands: ChatCommands = {
 					if (manager.filename.startsWith(FS('.server-dist/modlog').path)) void manager.destroy();
 				}
 
-				const {Modlog} = require('../modlog');
-				Rooms.Modlog = new Modlog(
-					Rooms.MODLOG_PATH || 'logs/modlog',
-					Rooms.MODLOG_DB_PATH || `${__dirname}/../../databases/modlog.db`
-				);
+				const {mainModlog} = require('../modlog');
+				Rooms.Modlog = mainModlog;
 				this.sendReply("Re-initializing modlog streams...");
 				Rooms.Modlog.streams = streams;
 				Rooms.Modlog.sharedStreams = sharedStreams;
@@ -478,14 +662,13 @@ export const commands: ChatCommands = {
 		} catch (e) {
 			Rooms.global.notifyRooms(
 				['development', 'staff'] as RoomID[],
-				`|c|${user.getIdentity()}|/log ${user.name} used /hotpatch ${patch} - but something failed while trying to hot-patch.`
+				`|c|${user.getIdentity()}|/log ${user.name} used /hotpatch ${target} - but something failed while trying to hot-patch.`
 			);
-			return this.errorReply(`Something failed while trying to hot-patch ${patch}: \n${e.stack}`);
+			return this.errorReply(`Something failed while trying to hot-patch ${target}: \n${e.stack}`);
 		}
-		Monitor.hotpatchVersions[patch] = version;
 		Rooms.global.notifyRooms(
 			['development', 'staff'] as RoomID[],
-			`|c|${user.getIdentity()}|/log ${user.name} used /hotpatch ${patch}`
+			`|c|${user.getIdentity()}|/log ${user.name} used /hotpatch ${target}`
 		);
 	},
 	hotpatchhelp: [
@@ -518,7 +701,10 @@ export const commands: ChatCommands = {
 		if (!reason || !target.includes(separator)) return this.parse('/help nohotpatch');
 
 		const lock = Monitor.hotpatchLock;
-		const validDisable = ['chat', 'battles', 'formats', 'validator', 'tournaments', 'punishments', 'modlog', 'all'];
+		const validDisable = [
+			'roomsp', 'usersp', 'chat', 'battles', 'formats', 'validator',
+			'tournaments', 'punishments', 'modlog', 'all', 'processmanager',
+		];
 
 		if (!validDisable.includes(hotpatch)) {
 			return this.errorReply(`Disabling hotpatching "${hotpatch}" is not supported.`);
@@ -550,19 +736,70 @@ export const commands: ChatCommands = {
 		`/allowhotpatch [chat|formats|battles|validator|tournaments|punishments|modlog|all] [reason] - Enables hotpatching the specified part of the simulator. Requires: &`,
 	],
 
-	processes(target, room, user) {
-		this.checkCan('lockdown');
-
-		let buf = `<strong>${process.pid}</strong> - Main<br />`;
-		for (const manager of ProcessManager.processManagers) {
-			for (const [i, process] of manager.processes.entries()) {
-				buf += `<strong>${process.getProcess().pid}</strong> - ${manager.basename} ${i} (load ${process.load})<br />`;
-			}
-			for (const [i, process] of manager.releasingProcesses.entries()) {
-				buf += `<strong>${process.getProcess().pid}</strong> - PENDING RELEASE ${manager.basename} ${i} (load ${process.load})<br />`;
-			}
+	async processes(target, room, user) {
+		const devRoom = Rooms.get('development');
+		if (!(devRoom && Users.Auth.atLeast(devRoom.auth.getDirect(user.id), '%'))) {
+			this.checkCan('lockdown');
 		}
 
+		const processes = new Map<string, ProcessData>();
+
+		await new Promise<void>(resolve => {
+			const child = child_process.exec('ps -o pid,%cpu,time,command', {cwd: `${__dirname}/../..`}, (err, stdout) => {
+				if (err) throw err;
+				const rows = stdout.split('\n').slice(1); // first line is the table header
+				for (const row of rows) {
+					if (!row.trim()) continue;
+					const [pid, cpu, time, ...rest] = row.split(' ').filter(Boolean);
+					if (pid === `${child.pid}`) continue; // ignore this process
+					const entry: ProcessData = {cmd: rest.join(' ')};
+					if (time && time !== '00:00:00') entry.time = time;
+					if (cpu && cpu !== '0.0') entry.cpu = `${cpu}%`;
+					processes.set(pid, entry);
+				}
+				resolve();
+			});
+		});
+
+		let buf = `<strong>${process.pid}</strong> - Main `;
+		const mainProcess = processes.get(`${process.pid}`)!;
+		if (mainProcess.cpu) buf += `(CPU ${mainProcess.cpu}`;
+		if (mainProcess.time) buf += mainProcess.cpu ? `, time: ${mainProcess.time})` : `(time: ${mainProcess.time})`;
+		buf += `<br /><br /><strong>Process managers:</strong><br />`;
+		processes.delete(`${process.pid}`);
+
+		for (const manager of ProcessManager.processManagers) {
+			for (const [i, process] of manager.processes.entries()) {
+				const pid = process.getProcess().pid;
+				buf += `<strong>${pid}</strong> - ${manager.basename} ${i} (load ${process.getLoad()}`;
+				const info = processes.get(`${pid}`)!;
+				if (info.cpu) buf += `, CPU: ${info.cpu}`;
+				if (info.time) buf += `, time: ${info.time}`;
+				buf += `)<br />`;
+				processes.delete(`${pid}`);
+			}
+			for (const [i, process] of manager.releasingProcesses.entries()) {
+				const pid = process.getProcess().pid;
+				buf += `<strong>${pid}</strong> - PENDING RELEASE ${manager.basename} ${i} (load ${process.getLoad()}`;
+				const info = processes.get(`${pid}`)!;
+				if (info.cpu) buf += `, CPU: ${info.cpu}`;
+				if (info.time) buf += `, time: ${info.time}`;
+				buf += `)<br />`;
+				processes.delete(`${pid}`);
+			}
+		}
+		buf += `<br />`;
+		buf += `<details class="readmore"><summary><strong>Other processes:</strong></summary>`;
+
+		for (const [pid, process] of processes) {
+			buf += `<strong>${pid}</strong> - <code>${process.cmd}</code>`;
+			if (process.cpu) buf += ` (CPU: ${process.cpu}`;
+			if (process.time) {
+				buf += `${process.cpu ? `, ` : ' ('}time: ${process.time})`;
+			}
+			buf += `<br />`;
+		}
+		buf += `</details>`;
 		this.sendReplyBox(buf);
 	},
 
@@ -593,7 +830,7 @@ export const commands: ChatCommands = {
 		if (!parsed) {
 			return this.errorReply(`Command "/${target}" is in an invalid format.`);
 		}
-		const {handler, cmd} = parsed;
+		const {handler, fullCmd} = parsed;
 		if (!handler) {
 			return this.errorReply(`Command "/${target}" not found.`);
 		}
@@ -601,7 +838,7 @@ export const commands: ChatCommands = {
 			return this.errorReply(`Command "/${target}" is already disabled`);
 		}
 		handler.disabled = true;
-		this.addGlobalModAction(`${user.name} disabled the command /${cmd}.`);
+		this.addGlobalModAction(`${user.name} disabled the command /${fullCmd}.`);
 		this.globalModlog(`DISABLECOMMAND`, null, target);
 	},
 	disablecommandhelp: [`/disablecommand [command] - Disables the given [command]. Requires: &`],
@@ -827,78 +1064,40 @@ export const commands: ChatCommands = {
 
 	async updateserver(target, room, user, connection) {
 		this.canUseConsole();
-		const isPrivate = toID(target) === 'private';
 		if (Monitor.updateServerLock) {
 			return this.errorReply(`/updateserver - Another update is already in progress (or a previous update crashed).`);
 		}
-		if (isPrivate && (!Config.privatecodepath || !path.isAbsolute(Config.privatecodepath))) {
-			return this.errorReply("`Config.privatecodepath` must be set to an absolute path before using /updateserver private.");
-		}
 
+		const validPrivateCodePath = Config.privatecodepath && path.isAbsolute(Config.privatecodepath);
+		target = toID(target);
 		Monitor.updateServerLock = true;
 
-		const exec = (command: string) => bash(command, this, isPrivate ? Config.privatecodepath : undefined);
 
-		this.addGlobalModAction(`${user.name} used /updateserver${isPrivate ? ` private` : ``}`);
-		this.sendReply(`Fetching newest version...`);
-
-		let [code, stdout, stderr] = await exec(`git fetch`);
-		if (code) throw new Error(`updateserver: Crash while fetching - make sure this is a Git repository`);
-		if (!stdout && !stderr) {
-			this.sendReply(`There were no updates.`);
-			Monitor.updateServerLock = false;
-			return;
-		}
-
-		[code, stdout, stderr] = await exec(`git rev-parse HEAD`);
-		if (code || stderr) throw new Error(`updateserver: Crash while grabbing hash`);
-		const oldHash = String(stdout).trim();
-
-		[code, stdout, stderr] = await exec(`git stash save "PS /updateserver autostash"`);
-		let stashedChanges = true;
-		if (code) throw new Error(`updateserver: Crash while stashing`);
-		if ((stdout + stderr).includes("No local changes")) {
-			stashedChanges = false;
-		} else if (stderr) {
-			throw new Error(`updateserver: Crash while stashing`);
+		let success = true;
+		if (target === 'private') {
+			if (!validPrivateCodePath) {
+				throw new Chat.ErrorMessage("`Config.privatecodepath` must be set to an absolute path before using /updateserver private.");
+			}
+			success = await updateserver(this, Config.privatecodepath);
+			this.addGlobalModAction(`${user.name} used /updateserver private`);
 		} else {
-			this.sendReply(`Saving changes...`);
+			if (target !== 'public' && validPrivateCodePath) {
+				success = await updateserver(this, Config.privatecodepath);
+			}
+			success = success && await updateserver(this, path.resolve(`${__dirname}/../..`));
+			this.addGlobalModAction(`${user.name} used /updateserver${target === 'public' ? ' public' : ''}`);
 		}
 
-		// errors can occur while rebasing or popping the stash; make sure to recover
-		try {
-			this.sendReply(`Rebasing...`);
-			[code] = await exec(`git rebase --no-autostash FETCH_HEAD`);
-			if (code) {
-				// conflict while rebasing
-				await exec(`git rebase --abort`);
-				throw new Error(`restore`);
-			}
+		this.sendReply(`Rebuilding...`);
+		await rebuild(this);
+		this.sendReply(success ? `DONE` : `FAILED, old changes restored.`);
 
-			if (stashedChanges) {
-				this.sendReply(`Restoring saved changes...`);
-				[code] = await exec(`git stash pop`);
-				if (code) {
-					// conflict while popping stash
-					await exec(`git reset HEAD .`);
-					await exec(`git checkout .`);
-					throw new Error(`restore`);
-				}
-			}
-
-			this.sendReply(`Rebuilding...`);
-			await rebuild(this);
-			this.sendReply(`SUCCESSFUL, server updated.`);
-		} catch (e) {
-			// failed while rebasing or popping the stash
-			await exec(`git reset --hard ${oldHash}`);
-			if (stashedChanges) await exec(`git stash pop`);
-			this.sendReply(`Rebuilding...`);
-			await rebuild(this);
-			this.sendReply(`FAILED, old changes restored.`);
-		}
 		Monitor.updateServerLock = false;
 	},
+	updateserverhelp: [
+		`/updateserver - Updates the server's code from its Git repository, including private code if present. Requires: console access`,
+		`/updateserver private - Updates only the server's private code. Requires: console access`,
+	],
 
 	async rebuild(target, room, user, connection) {
 		this.canUseConsole();
@@ -993,19 +1192,8 @@ export const commands: ChatCommands = {
 		[cmd, target] = Utils.splitFirst(target, ' ');
 		if (cmd.endsWith(',')) cmd = cmd.slice(0, -1);
 		const targets = target.split(',');
-		function getPlayer(input: string) {
-			const player = battle.playerTable[toID(input)];
-			if (player) return player.slot;
-			if (input.includes('1')) return 'p1';
-			if (input.includes('2')) return 'p2';
-			return 'p3';
-		}
-		function getPokemon(input: string) {
-			if (/^[0-9]+$/.test(input.trim())) {
-				return `.pokemon[${(parseInt(input) - 1)}]`;
-			}
-			return `.pokemon.find(p => p.baseSpecies.id==='${toID(input)}' || p.species.id==='${toID(input)}')`;
-		}
+		if (targets.length === 1 && targets[0] === '') targets.pop();
+		let player, pokemon, move, stat, value;
 		switch (cmd) {
 		case 'hp':
 		case 'h':
@@ -1013,8 +1201,9 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
+			[player, pokemon, value] = targets.map(toID);
 			void battle.stream.write(
-				`>eval let p=${getPlayer(targets[0]) + getPokemon(targets[1])};p.sethp(${parseInt(targets[2])});if (p.isActive)battle.add('-damage',p,p.getHealth);`
+				`>eval let p=pokemon('${player}', '${pokemon}');p.sethp(${parseInt(value)});if (p.isActive)battle.add('-damage',p,p.getHealth);`
 			);
 			break;
 		case 'status':
@@ -1023,8 +1212,9 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
+			[player, pokemon, value] = targets.map(toID);
 			void battle.stream.write(
-				`>eval let pl=${getPlayer(targets[0])};let p=pl${getPokemon(targets[1])};p.setStatus('${toID(targets[2])}');if (!p.isActive){battle.add('','please ignore the above');battle.add('-status',pl.active[0],pl.active[0].status,'[silent]');}`
+				`>eval let pl=player('${player}');let p=pokemon(pl,'${pokemon}');p.setStatus('${value}');if (!p.isActive){battle.add('','please ignore the above');battle.add('-status',pl.active[0],pl.active[0].status,'[silent]');}`
 			);
 			break;
 		case 'pp':
@@ -1032,8 +1222,9 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
+			[player, pokemon, move, value] = targets.map(toID);
 			void battle.stream.write(
-				`>eval let pl=${getPlayer(targets[0])};let p=pl${getPokemon(targets[1])};p.getMoveData('${toID(targets[2])}').pp = ${parseInt(targets[3])};`
+				`>eval pokemon('${player}','${pokemon}').getMoveData('${move}').pp = ${parseInt(value)};`
 			);
 			break;
 		case 'boost':
@@ -1042,8 +1233,9 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
+			[player, pokemon, stat, value] = targets.map(toID);
 			void battle.stream.write(
-				`>eval let p=${getPlayer(targets[0]) + getPokemon(targets[1])};battle.boost({${toID(targets[2])}:${parseInt(targets[3])}},p)`
+				`>eval let p=pokemon('${player}','${pokemon}');battle.boost({${stat}:${parseInt(value)}},p)`
 			);
 			break;
 		case 'volatile':
@@ -1052,8 +1244,9 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
+			[player, pokemon, value] = targets.map(toID);
 			void battle.stream.write(
-				`>eval let p=${getPlayer(targets[0]) + getPokemon(targets[1])};p.addVolatile('${toID(targets[2])}')`
+				`>eval pokemon('${player}','${pokemon}').addVolatile('${value}')`
 			);
 			break;
 		case 'sidecondition':
@@ -1062,7 +1255,8 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
-			void battle.stream.write(`>eval let p=${getPlayer(targets[0])}.addSideCondition('${toID(targets[1])}', 'debug')`);
+			[player, value] = targets.map(toID);
+			void battle.stream.write(`>eval player('${player}').addSideCondition('${value}', 'debug')`);
 			break;
 		case 'fieldcondition': case 'pseudoweather':
 		case 'fc':
@@ -1070,7 +1264,8 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
-			void battle.stream.write(`>eval battle.field.addPseudoWeather('${toID(targets[0])}', 'debug')`);
+			[value] = targets.map(toID);
+			void battle.stream.write(`>eval battle.field.addPseudoWeather('${value}', 'debug')`);
 			break;
 		case 'weather':
 		case 'w':
@@ -1078,7 +1273,8 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
-			void battle.stream.write(`>eval battle.field.setWeather('${toID(targets[0])}', 'debug')`);
+			[value] = targets.map(toID);
+			void battle.stream.write(`>eval battle.field.setWeather('${value}', 'debug')`);
 			break;
 		case 'terrain':
 		case 't':
@@ -1086,7 +1282,23 @@ export const commands: ChatCommands = {
 				this.errorReply("Incorrect command use");
 				return this.parse('/help editbattle');
 			}
-			void battle.stream.write(`>eval battle.field.setTerrain('${toID(targets[0])}', 'debug')`);
+			[value] = targets.map(toID);
+			void battle.stream.write(`>eval battle.field.setTerrain('${value}', 'debug')`);
+			break;
+		case 'reseed':
+			if (targets.length !== 0) {
+				if (targets.length !== 4) {
+					this.errorReply("Seed must have 4 parts");
+					return this.parse('/help editbattle');
+				}
+				// this just tests for a 5-digit number, close enough to uint16
+				if (!targets.every(val => /^[0-9]{1,5}$/.test(val))) {
+					this.errorReply("Seed parts much be unsigned 16-bit integers");
+					return this.parse('/help editbattle');
+				}
+			}
+			void battle.stream.write(`>reseed ${targets.join(',')}`);
+			if (targets.length) this.sendReply(`Reseeded to ${targets.join(',')}`);
 			break;
 		default:
 			this.errorReply(`Unknown editbattle command: ${cmd}`);
@@ -1103,6 +1315,7 @@ export const commands: ChatCommands = {
 		`/editbattle fieldcondition [fieldcondition]`,
 		`/editbattle weather [weather]`,
 		`/editbattle terrain [terrain]`,
+		`/editbattle reseed [optional seed]`,
 		`Short forms: /ebat h OR s OR pp OR b OR v OR sc OR fc OR w OR t`,
 		`[player] must be a username or number, [pokemon] must be species name or party slot number (not nickname), [move] must be move name.`,
 	],
