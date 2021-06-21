@@ -87,6 +87,7 @@ export class Battle {
 	reportExactHP: boolean;
 	reportPercentages: boolean;
 	supportCancel: boolean;
+	forceMega: boolean;
 
 	queue: BattleQueue;
 	readonly faintQueue: FaintedPokemon[];
@@ -171,6 +172,7 @@ export class Battle {
 		this.reportExactHP = !!format.debug;
 		this.reportPercentages = false;
 		this.supportCancel = false;
+		this.forceMega = false;
 
 		this.queue = new BattleQueue(this);
 		this.faintQueue = [];

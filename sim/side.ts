@@ -541,6 +541,9 @@ export class Side {
 				return this.emitChoiceError(`Can't move: You can only Dynamax once per battle.`);
 			}
 		}
+		if (this.battle.forceMega && pokemon.canMegaEvo && !mega) {
+			return this.emitChoiceError(`Can't move: ${pokemon.name} must Mega Evolve this turn.`);
+		}
 
 		this.choice.actions.push({
 			choice: 'move',
@@ -585,6 +588,11 @@ export class Side {
 			return this.emitChoiceError(`Can't switch: You sent more choices than unfainted Pokémon`);
 		}
 		const pokemon = this.active[index];
+
+		if (this.battle.forceMega && pokemon.canMegaEvolve) {
+			return this.emitChoiceError(`Can't switch: ${pokemon.name} must Mega Evolve this turn.`);
+		}
+
 		const autoChoose = !slotText;
 		let slot;
 		if (autoChoose) {

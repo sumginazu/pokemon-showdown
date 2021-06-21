@@ -546,6 +546,27 @@ export const Formats: {[k: string]: FormatData} = {
 			}
 		},
 	},
+	"2itemclause": {
+		effectType: 'ValidatorRule',
+		name: 'Item Clause... 2!',
+		desc: "Prevents teams from having more than two Pok&eacute;mon with the same item",
+		onBegin() {
+			this.add('rule', '2 Item Clause: Limit two of each item');
+		},
+		onValidateTeam(team) {
+			const itemTable = new Map<string, number>();
+			for (const set of team) {
+				const item = this.toID(set.item);
+				if (!item) continue;
+				if ((itemTable.get(item) || 0) >= 2) {
+					return [
+						`You are limited to two of each item by Item Clause.`,
+						`(You have more than two ${this.dex.getItem(item).name})`,
+					];
+				}
+				itemTable.set(item, (itemTable.get(item) || 0) + 1);
+			}
+		},
 	"2abilityclause": {
 		effectType: 'ValidatorRule',
 		name: '2 Ability Clause',
@@ -854,6 +875,14 @@ export const Formats: {[k: string]: FormatData} = {
 			this.supportCancel = true;
 		},
 	},
+	forcedmegamod: {
+		effectType: 'Rule',
+		name: 'Forced Mega Evolution Mod',
+		desc: "Forces players to click the Mega Evolution button as soon as possible.",
+		onBegin() {
+			this.forceMega = true;
+		},
+	},
 	sleepclausemod: {
 		effectType: 'Rule',
 		name: 'Sleep Clause Mod',
@@ -947,6 +976,48 @@ export const Formats: {[k: string]: FormatData} = {
 			}
 		},
 	},
+	roysaidso: {
+		effectType: 'ValidatorRule',
+		name: 'Roy Said So Clause',
+		desc: 'Complex bans for Roy League.',
+		onBegin() {
+			this.add('rule', 'Roy Said So Clause: don\'t even THINK about it');
+		},
+		onValidateSet(set) {
+			let species = this.dex.getSpecies(set.species);
+			//blaziken can't have z crystal or speed boost
+			//dragapult can't have ghostium z
+			//dragapult can't have both dragon darts AND substitute
+			//gothitelle can't have shadow tag
+			//mega blastoise can't have shell smash
+			if (species.baseSpecies == "Blaziken") {
+				if (this.dex.getItem(set.item).isZCrystal) {
+					return ['Roy Says: Blaziken cannot hold a Z-Crystal.'];
+				}
+				if (set.ability.id == 'speedboost') {
+					return ['Roy Says: Blaziken cannot have the ability Speed Boost.'];
+				}
+			} else if (species.baseSpecies == "Dragapult") {
+				if (set.item.id == 'ghostiumz') {
+					return ['Roy Says: Dragapult cannot hold Ghostium-Z.'];
+				}
+				hasDarts = set.moves.filter(move => move.id == 'dragondarts').length > 0;
+				hasSub = set.moves.filter(move => move.id == 'substitute').length > 0;
+				if (hasDarts && hasSub) {
+					return ['Roy Says: Dragapult cannot know both Dragon Darts and Substitute.'];
+				}
+			} else if (species.baseSpecies == "Gothitelle") {
+				if (set.ability.id == 'shadowtag') {
+					return ['Roy Says: Gothitelle cannot have the ability Shadow Tag.'];
+				}
+			} else if (species.baseSpecies == "Blastoise") {
+				hasShellSmash = set.moves.filter(move => move.id == 'shellsmash').length > 0;
+				if (set.item.megaStone && hasShellSmash) {
+					return ['Roy Says: Mega Blastoise cannot know Shell Smash.'];
+				}
+			}
+		},
+	},
 	sametypeclause: {
 		effectType: 'ValidatorRule',
 		name: 'Same Type Clause',
@@ -974,6 +1045,36 @@ export const Formats: {[k: string]: FormatData} = {
 						species = this.dex.getSpecies("Necrozma-Ultra");
 						typeTable = typeTable.filter(type => species.types.includes(type));
 					}
+				}
+				if (!typeTable.length) return [`Your team must share a type.`];
+			}
+		},
+	},
+	sametypeclausemega: {
+		effectType: 'ValidatorRule',
+		name: 'Same Type Clause +Mega',
+		desc: "Forces all Pok&eacute;mon on a team to share a type with each other. For Pok&eacute;mon holding a Mega Stone, only considers its types post-Mega Evolving. (ex. Mega Pinsir can be on a Flying monotype team.)",
+		onBegin() {
+			this.add('rule', 'Same Type Clause (+ Mega): Pokémon in a team must share a type');
+		},
+		onValidateTeam(team) {
+			let typeTable: string[] = [];
+			for (const [i, set] of team.entries()) {
+				var species = this.dex.getSpecies(set.species);
+				if (!species.types) return [`Invalid pokemon ${set.name || set.species}`];
+				if (this.gen >= 7) {
+					const item = this.dex.getItem(set.item);
+					if (item.megaStone && species.baseSpecies === item.megaEvolves) {
+						species = this.dex.getSpecies(item.megaStone);
+					}
+					if (item.id === "ultranecroziumz" && species.baseSpecies === "Necrozma") {
+						species = this.dex.getSpecies("Necrozma-Ultra");
+					}
+				}
+				if (i === 0) {
+					typeTable = species.types;
+				} else {
+					typeTable = typeTable.filter(type => species.types.includes(type));
 				}
 				if (!typeTable.length) return [`Your team must share a type.`];
 			}
