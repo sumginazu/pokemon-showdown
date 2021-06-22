@@ -1,4 +1,7 @@
 // Note: These are the rules that formats use
+
+import { consoleips } from "../config/config-example";
+
 // The list of formats is stored in config/formats.js
 export const Formats: {[k: string]: FormatData} = {
 
@@ -546,7 +549,7 @@ export const Formats: {[k: string]: FormatData} = {
 			}
 		},
 	},
-	"2itemclause": {
+	"itemclause2": {
 		effectType: 'ValidatorRule',
 		name: 'Item Clause... 2!',
 		desc: "Prevents teams from having more than two Pok&eacute;mon with the same item",
@@ -567,6 +570,7 @@ export const Formats: {[k: string]: FormatData} = {
 				itemTable.set(item, (itemTable.get(item) || 0) + 1);
 			}
 		},
+	},
 	"2abilityclause": {
 		effectType: 'ValidatorRule',
 		name: '2 Ability Clause',
@@ -875,7 +879,7 @@ export const Formats: {[k: string]: FormatData} = {
 			this.supportCancel = true;
 		},
 	},
-	forcedmegamod: {
+	forcedmegaevolutionmod: {
 		effectType: 'Rule',
 		name: 'Forced Mega Evolution Mod',
 		desc: "Forces players to click the Mega Evolution button as soon as possible.",
@@ -976,12 +980,24 @@ export const Formats: {[k: string]: FormatData} = {
 			}
 		},
 	},
-	roysaidso: {
+	roysaidsoclause: {
 		effectType: 'ValidatorRule',
 		name: 'Roy Said So Clause',
 		desc: 'Complex bans for Roy League.',
 		onBegin() {
 			this.add('rule', 'Roy Said So Clause: don\'t even THINK about it');
+		},
+		onValidateTeam(team) {
+			var hasZ = false
+			for (const [i, set] of team.entries()) {
+				if (this.dex.getItem(set.item).zMove) {
+					if (!hasZ) {
+						hasZ = true;
+						continue;
+					}
+					return ['Roy Says: You can only bring one Z-crystal.']
+				}
+			}
 		},
 		onValidateSet(set) {
 			let species = this.dex.getSpecies(set.species);
@@ -991,28 +1007,32 @@ export const Formats: {[k: string]: FormatData} = {
 			//gothitelle can't have shadow tag
 			//mega blastoise can't have shell smash
 			if (species.baseSpecies == "Blaziken") {
-				if (this.dex.getItem(set.item).isZCrystal) {
+				if (this.dex.getItem(set.item).zMove) {
 					return ['Roy Says: Blaziken cannot hold a Z-Crystal.'];
 				}
-				if (set.ability.id == 'speedboost') {
+				if (set.ability == 'speedboost') {
 					return ['Roy Says: Blaziken cannot have the ability Speed Boost.'];
 				}
 			} else if (species.baseSpecies == "Dragapult") {
-				if (set.item.id == 'ghostiumz') {
-					return ['Roy Says: Dragapult cannot hold Ghostium-Z.'];
+				let errs = []
+				if (set.item == 'Ghostium Z') {
+					errs.push('Roy Says: Dragapult cannot hold Ghostium-Z.');
 				}
-				hasDarts = set.moves.filter(move => move.id == 'dragondarts').length > 0;
-				hasSub = set.moves.filter(move => move.id == 'substitute').length > 0;
+				let hasDarts = set.moves.includes('dragondarts');
+				let hasSub = set.moves.includes('substitute');
 				if (hasDarts && hasSub) {
-					return ['Roy Says: Dragapult cannot know both Dragon Darts and Substitute.'];
+					errs.push('Roy Says: Dragapult cannot know both Dragon Darts and Substitute.');
+				}
+				if (errs.length > 0) {
+					return errs;
 				}
 			} else if (species.baseSpecies == "Gothitelle") {
-				if (set.ability.id == 'shadowtag') {
+				if (set.ability == 'shadowtag') {
 					return ['Roy Says: Gothitelle cannot have the ability Shadow Tag.'];
 				}
 			} else if (species.baseSpecies == "Blastoise") {
-				hasShellSmash = set.moves.filter(move => move.id == 'shellsmash').length > 0;
-				if (set.item.megaStone && hasShellSmash) {
+				let hasShellSmash = set.moves.includes('shellsmash');
+				if (this.dex.getItem(set.item).megaStone && hasShellSmash) {
 					return ['Roy Says: Mega Blastoise cannot know Shell Smash.'];
 				}
 			}
@@ -1050,7 +1070,7 @@ export const Formats: {[k: string]: FormatData} = {
 			}
 		},
 	},
-	sametypeclausemega: {
+	"sametypeclausemega": {
 		effectType: 'ValidatorRule',
 		name: 'Same Type Clause +Mega',
 		desc: "Forces all Pok&eacute;mon on a team to share a type with each other. For Pok&eacute;mon holding a Mega Stone, only considers its types post-Mega Evolving. (ex. Mega Pinsir can be on a Flying monotype team.)",

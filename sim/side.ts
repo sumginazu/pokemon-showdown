@@ -589,7 +589,7 @@ export class Side {
 		}
 		const pokemon = this.active[index];
 
-		if (this.battle.forceMega && pokemon.canMegaEvolve) {
+		if (this.battle.forceMega && pokemon.canMegaEvo) {
 			return this.emitChoiceError(`Can't switch: ${pokemon.name} must Mega Evolve this turn.`);
 		}
 
