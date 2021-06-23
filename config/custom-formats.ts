@@ -10,7 +10,7 @@ export const Formats: FormatList = [
 		column: 1,
 	},
 	{
-		name: "[Gen 8] Roy Monotype (Nat Dex) 2020",
+		name: "[Gen 8] Roy Monotype (Nat Dex) 2021",
 		mod: 'gen8',
 		ruleset: ['Standard NatDex', 'Roy Said So Clause', 'Same Type Clause +Mega', 'Item Clause... 2!', 'Evasion Moves Clause', 'Dynamax Clause', 'Sleep Clause Mod', 'Forced Mega Evolution Mod'],
 		banlist: [
